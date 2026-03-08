@@ -11,7 +11,7 @@
 
 import { getVaultState, saveVaultState } from './vault-workflow';
 import { encryptVaultData, decryptVaultData } from '../utils/crypto';
-import { supabase, syncService } from './supabase';
+import { supabase, syncService, vaultSyncService } from './supabase';
 import type { VaultState } from './vault-workflow';
 import type { Credential } from '../utils/types';
 
@@ -103,11 +103,19 @@ export async function pushSyncWorkflow(): Promise<{
 
     console.log('[PUSH_SYNC] Payload created, size:', encryptedVault.length, 'bytes');
 
-    // STEP 8: POST to server with retry logic
-    const pushResult = await pushWithRetry(syncPayload, signature, (sessionToken as string) || '');
+    // STEP 8: Push to Supabase
+    const pushResult = await vaultSyncService.saveVault(localStorage.zerovault_user_id, {
+      encrypted_data: encryptedVault,
+      version: vault.metadata.version,
+      metadata: {
+        totalCredentials: vault.credentials.length,
+        lastUpdated: new Date().toISOString(),
+        deviceInfo: localStorage.zerovault_device_id
+      }
+    });
 
     if (!pushResult.success) {
-      throw new Error(pushResult.error || 'Push failed');
+      throw new Error((pushResult.error as any)?.message || 'Push failed');
     }
 
     // STEP 9: Update local sync metadata
@@ -176,13 +184,15 @@ export async function pullSyncWorkflow(): Promise<{
 
     console.log('[PULL_SYNC] Requesting changes since version:', lastSyncVersion);
 
-    // STEP 4: Request changes from server
-    const pullResult = await pullWithRetry(lastSyncTime, (lastSyncVersion as number) || 0);
+    // STEP 4: Request changes from Supabase
+    const pullResult = await vaultSyncService.getVault(localSync.zerovault_user_id);
 
-    if (!pullResult.success || !pullResult.remoteVault) {
+    if (!pullResult.success || !pullResult.vault) {
       console.log('[PULL_SYNC] No changes available');
       return { success: true, changesCount: 0 };
     }
+
+    const remoteVaultEncrypted = pullResult.vault.encrypted_data;
 
     // STEP 5: Decrypt remote vault
     const sessionData = await chrome.storage.session.get('zerovault_master_key');
@@ -193,7 +203,7 @@ export async function pullSyncWorkflow(): Promise<{
     }
 
     console.log('[PULL_SYNC] Decrypting remote vault...');
-    const remoteVaultJson = await decryptVaultData(pullResult.remoteVault as string, masterKey as string);
+    const remoteVaultJson = await decryptVaultData(remoteVaultEncrypted, masterKey as string);
     const remoteVault: VaultState = JSON.parse(remoteVaultJson);
 
     // STEP 6: Merge with conflict resolution
@@ -364,108 +374,6 @@ function resolveCredentialConflict(local: Credential, remote: Credential): Crede
 }
 
 /**
- * HELPER: Push with retry logic
- * 
- * Exponential backoff: 1s, 2s, 4s, 8s...
- */
-async function pushWithRetry(
-  payload: any,
-  signature: string,
-  sessionToken: string
-): Promise<{ success: boolean; serverVersion?: number; error?: string }> {
-  const maxRetries = 3;
-  let attempt = 0;
-
-  while (attempt < maxRetries) {
-    try {
-      console.log('[PUSH_RETRY] Attempt', attempt + 1, 'of', maxRetries);
-
-      // POST /api/vault/sync/push
-      const response = await fetch('http://localhost:3000/api/vault/sync/push', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${sessionToken}`,
-          'X-Signature': signature,
-        },
-        body: JSON.stringify(payload),
-      });
-
-      if (response.ok) {
-        const result = await response.json();
-        return { success: true, serverVersion: result.vaultVersion };
-      }
-
-      if (response.status === 503) {
-        // Server unavailable: Don't retry aggressively
-        throw new Error('Service temporarily unavailable');
-      }
-
-      throw new Error(`HTTP ${response.status}`);
-    } catch (error: any) {
-      attempt++;
-      const delay = Math.pow(2, attempt) * 1000;
-
-      if (attempt >= maxRetries) {
-        return { success: false, error: error.message };
-      }
-
-      console.log('[PUSH_RETRY] Retrying in', delay, 'ms');
-      await new Promise(r => setTimeout(r, delay));
-    }
-  }
-
-  return { success: false, error: 'Max retries exceeded' };
-}
-
-/**
- * HELPER: Pull with retry logic
- */
-async function pullWithRetry(
-  lastSyncTime: number,
-  lastSyncVersion: number
-): Promise<{ success: boolean; remoteVault?: string; error?: string }> {
-  const maxRetries = 3;
-  let attempt = 0;
-
-  while (attempt < maxRetries) {
-    try {
-      console.log('[PULL_RETRY] Attempt', attempt + 1, 'of', maxRetries);
-
-      // GET /api/vault/sync/pull
-      const response = await fetch(
-        `http://localhost:3000/api/vault/sync/pull?since=${lastSyncTime}&version=${lastSyncVersion}`,
-        {
-          method: 'GET',
-          headers: {
-            'Authorization': `Bearer ${(await chrome.storage.session.get('zerovault_session_token')).zerovault_session_token}`,
-          },
-        }
-      );
-
-      if (response.ok) {
-        const result = await response.json();
-        return { success: true, remoteVault: result.encryptedVault };
-      }
-
-      throw new Error(`HTTP ${response.status}`);
-    } catch (error: any) {
-      attempt++;
-      const delay = Math.pow(2, attempt) * 1000;
-
-      if (attempt >= maxRetries) {
-        return { success: false, error: error.message };
-      }
-
-      console.log('[PULL_RETRY] Retrying in', delay, 'ms');
-      await new Promise(r => setTimeout(r, delay));
-    }
-  }
-
-  return { success: false, error: 'Max retries exceeded' };
-}
-
-/**
  * HELPER: Queue changes for offline sync
  */
 async function queuePendingSync(): Promise<void> {
@@ -478,21 +386,4 @@ async function queuePendingSync(): Promise<void> {
 
   await chrome.storage.local.set({ zerovault_sync_queue: queue });
   console.log('[QUEUE] Sync queued for later');
-}
-
-/**
- * HELPER: Create HMAC signature
- */
-async function createSignature(data: string, key: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const keyData = encoder.encode(key);
-  const messageData = encoder.encode(data);
-
-  const cryptoKey = await crypto.subtle.importKey('raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, [
-    'sign',
-  ]);
-
-  const signature = await crypto.subtle.sign('HMAC', cryptoKey, messageData);
-  const signatureArray = Array.from(new Uint8Array(signature));
-  return signatureArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
