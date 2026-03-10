@@ -260,4 +260,6 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 <div align="center">
   <sub>Built with ❤️ by the ZeroVault Team.</sub>
+  <br/>
+  <sub>Last updated: March 2026</sub>
 </div>
